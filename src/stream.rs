@@ -23,6 +23,8 @@ pub use futures_core::stream::Stream;
 
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 use alloc::boxed::Box;
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+use alloc::vec::Vec;
 
 use core::fmt;
 use core::future::Future;
@@ -1861,6 +1863,78 @@ pub trait StreamExt: Stream {
     {
         Box::pin(self)
     }
+
+    /// An adaptor for chunking up items of the stream inside a vector.
+    ///
+    /// This combinator will attempt to pull items from this stream and buffer
+    /// them into a local vector. At most `capacity` items will get buffered
+    /// before they're yielded from the returned stream.
+    ///
+    /// Note that the vectors returned from this iterator may not always have
+    /// `capacity` elements. If the underlying stream ended and only a partial
+    /// vector was created, it'll be returned. Additionally if an error happens
+    /// from the underlying stream then the currently buffered items will be
+    /// yielded.
+    ///
+    /// This method is only available when the `alloc` feature of this
+    /// library is activated.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if `capacity` is zero.
+    #[cfg(feature = "alloc")]
+    fn chunks(self, capacity: usize) -> Chunks<Self>
+    where
+        Self: Sized,
+    {
+        Chunks::new(self, capacity)
+    }
+
+    /// An adaptor for chunking up successful items of the stream inside a vector.
+    ///
+    /// This combinator will attempt to pull successful items from this stream and buffer
+    /// them into a local vector. At most `capacity` items will get buffered
+    /// before they're yielded from the returned stream.
+    ///
+    /// Note that the vectors returned from this iterator may not always have
+    /// `capacity` elements. If the underlying stream ended and only a partial
+    /// vector was created, it'll be returned. Additionally if an error happens
+    /// from the underlying stream then the currently buffered items will be
+    /// yielded.
+    ///
+    /// This method is only available when the `std` or `alloc` feature of this
+    /// library is activated, and it is activated by default.
+    ///
+    /// This function is similar to
+    /// [`StreamExt::chunks`](StreamExt::chunks) but exits
+    /// early if an error occurs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # spin_on::spin_on(async {
+    /// use futures_lite::stream::{self, TryChunksError, StreamExt};
+    ///
+    /// let stream = stream::iter(vec![Ok::<i32, i32>(1), Ok(2), Ok(3), Err(4), Ok(5), Ok(6)]);
+    /// let mut stream = stream.try_chunks(2);
+    ///
+    /// assert_eq!(stream.try_next().await, Ok(Some(vec![1, 2])));
+    /// assert_eq!(stream.try_next().await, Err(TryChunksError(vec![3], 4)));
+    /// assert_eq!(stream.try_next().await, Ok(Some(vec![5, 6])));
+    /// # })
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if `capacity` is zero.
+    #[cfg(feature = "alloc")]
+    fn try_chunks<T, E>(self, capacity: usize) -> TryChunks<Self, T>
+    where
+        Self: Sized,
+        Self: Stream<Item = Result<T, E>>,
+    {
+        TryChunks::new(self, capacity)
+    }
 }
 
 impl<S: Stream + ?Sized> StreamExt for S {}
@@ -3308,5 +3382,201 @@ impl<'a, S: Stream + Unpin + ?Sized> Stream for Drain<'a, S> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (_, hi) = self.stream.size_hint();
         (0, hi)
+    }
+}
+
+#[cfg(feature = "alloc")]
+pin_project! {
+    /// Stream for the [`chunks`](StreamExt::chunks) method.
+    #[derive(Debug)]
+    #[must_use = "streams do nothing unless polled"]
+    pub struct Chunks<S: Stream> {
+        #[pin]
+        stream: S,
+        items: Vec<S::Item>,
+        cap: usize, // https://github.com/rust-lang/futures-rs/issues/1475
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: Stream> Chunks<S> {
+    pub(super) fn new(stream: S, capacity: usize) -> Self {
+        assert!(capacity > 0);
+
+        Self {
+            stream,
+            items: Vec::with_capacity(capacity),
+            cap: capacity,
+        }
+    }
+
+    fn take(self: Pin<&mut Self>) -> Vec<S::Item> {
+        let cap = self.cap;
+        mem::replace(self.project().items, Vec::with_capacity(cap))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: Stream> Stream for Chunks<S> {
+    type Item = Vec<S::Item>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.as_mut().project();
+        loop {
+            match ready!(this.stream.as_mut().poll_next(cx)) {
+                // Push the item into the buffer and check whether it is full.
+                // If so, replace our buffer with a new and empty one and return
+                // the full one.
+                Some(item) => {
+                    this.items.push(item);
+                    if this.items.len() >= *this.cap {
+                        return Poll::Ready(Some(self.take()));
+                    }
+                }
+
+                // Since the underlying stream ran out of values, return what we
+                // have buffered, if we have anything.
+                None => {
+                    let last = if this.items.is_empty() {
+                        None
+                    } else {
+                        let full_buf = mem::take(this.items);
+                        Some(full_buf)
+                    };
+
+                    return Poll::Ready(last);
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (lower, upper) = self.stream.size_hint();
+        let len = self.items.len();
+        let lower = div_ceil_(lower.saturating_add(len), self.cap);
+        let upper = upper
+            .and_then(|u| u.checked_add(len))
+            .map(|u| div_ceil_(u, self.cap));
+        (lower, upper)
+    }
+}
+
+#[cfg(feature = "alloc")]
+pin_project! {
+    /// Stream for the [`try_chunks`](StreamExt::try_chunks) method.
+    #[derive(Debug)]
+    #[must_use = "streams do nothing unless polled"]
+    pub struct TryChunks<S, T> {
+        #[pin]
+        stream: S,
+        items: Vec<T>,
+        cap: usize, // https://github.com/rust-lang/futures-rs/issues/1475
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S, T> TryChunks<S, T> {
+    pub(super) fn new(stream: S, capacity: usize) -> Self {
+        assert!(capacity > 0);
+
+        Self {
+            stream,
+            items: Vec::with_capacity(capacity),
+            cap: capacity,
+        }
+    }
+
+    fn take(self: Pin<&mut Self>) -> Vec<T> {
+        let cap = self.cap;
+        mem::replace(self.project().items, Vec::with_capacity(cap))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<S: Stream<Item = Result<T, E>>, T, E> Stream for TryChunks<S, T> {
+    type Item = Result<Vec<T>, TryChunksError<T, E>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.as_mut().project();
+        loop {
+            match ready!(this.stream.as_mut().poll_next(cx)) {
+                // Push the item into the buffer and check whether it is full.
+                // If so, replace our buffer with a new and empty one and return
+                // the full one.
+                Some(item) => match item {
+                    Ok(item) => {
+                        this.items.push(item);
+                        if this.items.len() >= *this.cap {
+                            return Poll::Ready(Some(Ok(self.take())));
+                        }
+                    }
+                    Err(e) => {
+                        return Poll::Ready(Some(Err(TryChunksError(self.take(), e))));
+                    }
+                },
+
+                // Since the underlying stream ran out of values, return what we
+                // have buffered, if we have anything.
+                None => {
+                    let last = if this.items.is_empty() {
+                        None
+                    } else {
+                        let full_buf = mem::take(this.items);
+                        Some(full_buf)
+                    };
+
+                    return Poll::Ready(last.map(Ok));
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (lower, upper) = self.stream.size_hint();
+        let len = self.items.len();
+        let lower = div_ceil_(lower.saturating_add(len), self.cap);
+        let upper = upper
+            .and_then(|u| u.checked_add(len))
+            .map(|u| div_ceil_(u, self.cap));
+        (lower, upper)
+    }
+}
+
+/// Error indicating, that while chunk was collected inner stream produced an error.
+///
+/// Contains all items that were collected before an error occurred, and the stream error itself.
+#[cfg(feature = "alloc")]
+#[derive(PartialEq, Eq)]
+pub struct TryChunksError<T, E>(pub Vec<T>, pub E);
+
+#[cfg(feature = "alloc")]
+impl<T, E: fmt::Debug> fmt::Debug for TryChunksError<T, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.1.fmt(f)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T, E: fmt::Display> fmt::Display for TryChunksError<T, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.1.fmt(f)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T, E: fmt::Debug + fmt::Display> std::error::Error for TryChunksError<T, E> {}
+
+// int::div_cell is stable in rust 1.73 and above
+// since currently our msrv is 1.60
+// we just copy the code from std
+// and rename to div_cell_ to avoid conflict
+#[cfg(feature = "alloc")]
+fn div_ceil_(a: usize, b: usize) -> usize {
+    let d = a / b;
+    let r = a % b;
+    if r > 0 && b > 0 {
+        d + 1
+    } else {
+        d
     }
 }
